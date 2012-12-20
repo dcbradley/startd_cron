@@ -1,0 +1,109 @@
+#!/bin/sh
+
+# NOTE: in Condor 7.4, the first argument is the startd cron module prefix
+# In Condor 7.6, the prefix is not passed as an argument
+# The following hack discards the startd cron module prefix,
+# when there is an extra argument that contains no "." characters
+if [ $# = 2 ] && [ "${1##*.*}" != "" ]; then
+  shift
+fi
+
+repo_path=$1
+if [ "$repo_path" = "" ]; then
+  echo "USAGE: $0 repository" 1>&2
+  exit 2
+fi
+
+if [ "${repo_path:0:1}" != "/" ]; then
+  repo_path="/cvmfs/$repo_path"
+fi
+
+repo=`basename $repo_path`
+
+
+if [ -f /etc/cvmfs/config.sh ]
+then
+  . /etc/cvmfs/config.sh
+else
+  echo "Failed to source /etc/cvmfs/config.sh" 1>&2
+  exit 1
+fi
+
+cvmfs_readconfig
+if [ $? -ne 0 ]; then
+  echo "Failed to read CernVM-FS configuration" 1>&2
+  exit 1
+fi
+
+cvmfs_readconfig $repo
+retval=$?
+if [ $retval -eq 1 ]; then
+  echo "Failed to read CernVM-FS configuration" 1>&2
+  exit 1
+fi
+
+if [ "$CVMFS_CACHE_DIR" = "" ]; then
+  echo "CVMFS_CACHE_DIR is not defined, or error running cvmfs_config." 1>&2
+  exit 1
+fi
+
+exists=False
+
+# ensure that there is sufficient space for the cvmfs cache
+
+# If the cache is so out of space that CVMFS cannot even start,
+# it is more useful to say "OutOfSpace" than "Exists=False",
+# so handle that here:
+if ! [ -d "$repo_path" ]; then
+  # minimal amount required to start up CVMFS
+  cvmfs_avail="10000"
+else
+  cvmfs_df="$(df -P "$repo_path" | tail -1)"
+  cvmfs_avail=`echo $cvmfs_df | awk '{print $4}'`
+  cvmfs_total=`echo $cvmfs_df | awk '{print $2}'`
+  cvmfs_used=`echo $cvmfs_df | awk '{print $3}'`
+  echo "CacheSizeKB = $cvmfs_total"
+  echo "CacheUsedKB = $cvmfs_used"
+fi
+
+if [ -d "$CVMFS_CACHE_DIR" ]; then
+  cache_avail=`df -P "$CVMFS_CACHE_DIR" | tail -1 | awk '{print $4}'`
+
+  if [ "$cvmfs_avail" -gt "$cache_avail" ]; then
+    echo "OutOfSpace = True"
+    out_of_space=1
+  fi
+
+  # We have observed cases where the txn directory did not exist.
+  # This causes cvmfs to appear to be working but to fail whenever
+  # it tries to download a new file.
+  for d in txn `seq 0 255 | xargs -n1 printf "%02x "`; do
+    if ! [ -d "$CVMFS_CACHE_DIR/$d" ]; then
+      echo "Missing directory $CVMFS_CACHE_DIR/$d"
+      exit 1
+    fi
+  done
+else
+  echo "Cannot access $CVMFS_CACHE_DIR" 1>&2
+  exit 1
+fi
+
+if [ "$out_of_space" != 1 ] && [ -d "$repo_path" ]; then
+
+  revision=`attr -q -g revision $repo_path`
+  if [ "$revision" = "" ]; then
+    echo "Error reading repository revision." 1>&2
+    exit 1
+  fi
+  echo "Revision = $revision"
+
+  # Set Exists to true for one hour.  The expiration is in case our
+  # next attempt to check cvmfs hangs.  We have observed automount
+  # problems cause this in SL5.3.
+  # Use LastHeardFrom rather than CurrentTime, so recycling of claims
+  # still works in the schedd.
+
+  exists="ifThenElse(isUndefined(LastHeardFrom),CurrentTime,LastHeardFrom) - `date "+%s"` < 3600"
+fi
+
+echo "Exists = $exists"
